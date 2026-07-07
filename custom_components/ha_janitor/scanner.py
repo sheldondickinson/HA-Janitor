@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers import area_registry as ar
@@ -26,10 +25,8 @@ def _as_iso(value: datetime | None) -> str | None:
 
 
 def _entry_state_to_string(state: Any) -> str:
-    """Normalise a config entry state enum/string."""
-    if isinstance(state, ConfigEntryState):
-        return state.value
-    return str(state)
+    """Normalise a config entry state enum/string across HA versions."""
+    return getattr(state, "value", str(state))
 
 
 def _duration_seconds(state: State | None, now: datetime) -> float | None:
@@ -42,6 +39,14 @@ def _duration_seconds(state: State | None, now: datetime) -> float | None:
 def _safe_attr(obj: Any, attr: str, default: Any = None) -> Any:
     """Read an attribute safely across HA versions."""
     return getattr(obj, attr, default)
+
+
+def _registry_items(registry_mapping: Any) -> dict[str, Any]:
+    """Return a normal dict from HA registry mapping-like containers."""
+    try:
+        return dict(registry_mapping)
+    except TypeError:
+        return {item.entity_id: item for item in registry_mapping.values()}
 
 
 class JanitorScanner:
@@ -57,7 +62,7 @@ class JanitorScanner:
 
     def build_entities(self) -> list[dict[str, Any]]:
         """Return entity audit rows."""
-        registry_entities = dict(self.entity_registry.entities)
+        registry_entities = _registry_items(self.entity_registry.entities)
         state_entity_ids = set(self.hass.states.async_entity_ids())
         all_entity_ids = sorted(set(registry_entities) | state_entity_ids)
 
@@ -68,15 +73,18 @@ class JanitorScanner:
         rows.sort(key=lambda item: (item.get("risk") != "review", item.get("entity_id") or ""))
         return rows
 
-    def build_devices(self) -> list[dict[str, Any]]:
+    def build_devices(self, entities: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         """Return device audit rows."""
-        entities = self.build_entities()
+        if entities is None:
+            entities = self.build_entities()
+
         entities_by_device: dict[str, list[dict[str, Any]]] = {}
         for entity in entities:
             device_id = entity.get("device_id")
             if device_id:
                 entities_by_device.setdefault(device_id, []).append(entity)
 
+        config_entries = list(self.hass.config_entries.async_entries())
         rows: list[dict[str, Any]] = []
         for device_id, device in self.device_registry.devices.items():
             linked_entities = entities_by_device.get(device_id, [])
@@ -94,7 +102,7 @@ class JanitorScanner:
             integration_domains = sorted(
                 {
                     entry.domain
-                    for entry in self.hass.config_entries.async_entries()
+                    for entry in config_entries
                     if entry.entry_id in config_entry_ids
                 }
             )
@@ -124,12 +132,18 @@ class JanitorScanner:
         rows.sort(key=lambda item: (item.get("risk") != "review", item.get("name") or ""))
         return rows
 
-    def build_integrations(self) -> list[dict[str, Any]]:
+    def build_integrations(
+        self,
+        entities: list[dict[str, Any]] | None = None,
+        devices: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
         """Return config-entry/integration audit rows."""
-        entities = self.build_entities()
-        devices = self.build_devices()
-        rows: list[dict[str, Any]] = []
+        if entities is None:
+            entities = self.build_entities()
+        if devices is None:
+            devices = self.build_devices(entities)
 
+        rows: list[dict[str, Any]] = []
         for entry in self.hass.config_entries.async_entries():
             entry_entities = [item for item in entities if item.get("config_entry_id") == entry.entry_id]
             entry_devices = [
@@ -162,8 +176,8 @@ class JanitorScanner:
     def build_summary(self) -> dict[str, Any]:
         """Return a summary audit payload."""
         entities = self.build_entities()
-        devices = self.build_devices()
-        integrations = self.build_integrations()
+        devices = self.build_devices(entities)
+        integrations = self.build_integrations(entities, devices)
 
         unavailable = [item for item in entities if item.get("state") == STATE_UNAVAILABLE]
         unknown = [item for item in entities if item.get("state") == STATE_UNKNOWN]
@@ -199,7 +213,7 @@ class JanitorScanner:
             "note": "v0.1 is read-only and does not scan references yet.",
         }
 
-    def _build_entity_row(self, entity_id: str, entry: er.RegistryEntry | None) -> dict[str, Any]:
+    def _build_entity_row(self, entity_id: str, entry: Any | None) -> dict[str, Any]:
         """Build a single entity row."""
         state = self.hass.states.get(entity_id)
         domain = entity_id.split(".", 1)[0] if "." in entity_id else entity_id
@@ -207,9 +221,7 @@ class JanitorScanner:
 
         device_id = _safe_attr(entry, "device_id") if entry else None
         device = self.device_registry.async_get(device_id) if device_id else None
-        area_id = None
-        if entry is not None:
-            area_id = _safe_attr(entry, "area_id")
+        area_id = _safe_attr(entry, "area_id") if entry else None
         if area_id is None and device is not None:
             area_id = _safe_attr(device, "area_id")
         area = self.area_registry.async_get_area(area_id) if area_id else None
