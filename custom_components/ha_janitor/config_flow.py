@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import voluptuous as vol
+
 from homeassistant import config_entries
 
 from .const import DOMAIN, NAME
@@ -26,9 +28,6 @@ class HAJanitorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=None,
+            data_schema=vol.Schema({}),
             errors={},
-            description_placeholders={
-                "message": "HA Janitor v0.1 is read-only and will not modify your Home Assistant instance."
-            },
         )
