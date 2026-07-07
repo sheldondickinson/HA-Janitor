@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# macOS / editors
+.DS_Store
+.vscode/settings.json
+.idea/
+
+# Home Assistant local/dev
+.storage/
+home-assistant_v2.db*
+secrets.yaml
+known_devices.yaml
+*.log
+
+# Frontend build output for later versions
+dist/
+node_modules/
