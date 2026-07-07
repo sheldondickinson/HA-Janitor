@@ -1,0 +1,14 @@
+{
+  "domain": "ha_janitor",
+  "name": "HA Janitor",
+  "after_dependencies": ["frontend", "websocket_api"],
+  "codeowners": ["@sheldondickinson"],
+  "config_flow": true,
+  "dependencies": ["websocket_api"],
+  "documentation": "https://github.com/sheldondickinson/HA-Janitor",
+  "iot_class": "local_polling",
+  "integration_type": "helper",
+  "issue_tracker": "https://github.com/sheldondickinson/HA-Janitor/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}
