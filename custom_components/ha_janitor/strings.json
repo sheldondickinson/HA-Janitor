@@ -1,0 +1,13 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "HA Janitor",
+        "description": "Set up HA Janitor. v0.1 is read-only and will not modify your Home Assistant instance."
+      }
+    },
+    "abort": {
+      "already_configured": "HA Janitor is already configured."
+    }
+  }
+}
