@@ -1,0 +1,247 @@
+"""Read-only scanner for HA Janitor v0.1."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.core import HomeAssistant, State
+from homeassistant.helpers import area_registry as ar
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+from homeassistant.util import dt as dt_util
+
+from .scoring import score_device, score_entity
+
+BAD_STATES = {STATE_UNAVAILABLE, STATE_UNKNOWN}
+
+
+def _as_iso(value: datetime | None) -> str | None:
+    """Return an ISO timestamp or None."""
+    if value is None:
+        return None
+    return value.isoformat()
+
+
+def _entry_state_to_string(state: Any) -> str:
+    """Normalise a config entry state enum/string."""
+    if isinstance(state, ConfigEntryState):
+        return state.value
+    return str(state)
+
+
+def _duration_seconds(state: State | None, now: datetime) -> float | None:
+    """Return seconds since last state change."""
+    if state is None or state.last_changed is None:
+        return None
+    return max(0.0, (now - state.last_changed).total_seconds())
+
+
+def _safe_attr(obj: Any, attr: str, default: Any = None) -> Any:
+    """Read an attribute safely across HA versions."""
+    return getattr(obj, attr, default)
+
+
+class JanitorScanner:
+    """Build read-only audit data from Home Assistant registries and states."""
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        """Initialise the scanner."""
+        self.hass = hass
+        self.entity_registry = er.async_get(hass)
+        self.device_registry = dr.async_get(hass)
+        self.area_registry = ar.async_get(hass)
+        self.now = dt_util.utcnow()
+
+    def build_entities(self) -> list[dict[str, Any]]:
+        """Return entity audit rows."""
+        registry_entities = dict(self.entity_registry.entities)
+        state_entity_ids = set(self.hass.states.async_entity_ids())
+        all_entity_ids = sorted(set(registry_entities) | state_entity_ids)
+
+        rows: list[dict[str, Any]] = []
+        for entity_id in all_entity_ids:
+            rows.append(self._build_entity_row(entity_id, registry_entities.get(entity_id)))
+
+        rows.sort(key=lambda item: (item.get("risk") != "review", item.get("entity_id") or ""))
+        return rows
+
+    def build_devices(self) -> list[dict[str, Any]]:
+        """Return device audit rows."""
+        entities = self.build_entities()
+        entities_by_device: dict[str, list[dict[str, Any]]] = {}
+        for entity in entities:
+            device_id = entity.get("device_id")
+            if device_id:
+                entities_by_device.setdefault(device_id, []).append(entity)
+
+        rows: list[dict[str, Any]] = []
+        for device_id, device in self.device_registry.devices.items():
+            linked_entities = entities_by_device.get(device_id, [])
+            unavailable_count = sum(1 for item in linked_entities if item.get("state") == STATE_UNAVAILABLE)
+            unknown_count = sum(1 for item in linked_entities if item.get("state") == STATE_UNKNOWN)
+            disabled_count = sum(1 for item in linked_entities if item.get("disabled"))
+            hidden_count = sum(1 for item in linked_entities if item.get("hidden"))
+            healthy_count = sum(
+                1
+                for item in linked_entities
+                if item.get("state") not in BAD_STATES and item.get("state") is not None
+            )
+
+            config_entry_ids = sorted(str(value) for value in (_safe_attr(device, "config_entries", set()) or set()))
+            integration_domains = sorted(
+                {
+                    entry.domain
+                    for entry in self.hass.config_entries.async_entries()
+                    if entry.entry_id in config_entry_ids
+                }
+            )
+            area_id = _safe_attr(device, "area_id")
+            area = self.area_registry.async_get_area(area_id) if area_id else None
+
+            row: dict[str, Any] = {
+                "device_id": device_id,
+                "name": _safe_attr(device, "name_by_user") or _safe_attr(device, "name"),
+                "manufacturer": _safe_attr(device, "manufacturer"),
+                "model": _safe_attr(device, "model"),
+                "area_id": area_id,
+                "area_name": area.name if area else None,
+                "config_entry_ids": config_entry_ids,
+                "integration_domains": integration_domains,
+                "entity_ids": sorted(item["entity_id"] for item in linked_entities),
+                "entity_count": len(linked_entities),
+                "unavailable_entity_count": unavailable_count,
+                "unknown_entity_count": unknown_count,
+                "disabled_entity_count": disabled_count,
+                "hidden_entity_count": hidden_count,
+                "healthy_entity_count": healthy_count,
+            }
+            row.update(score_device(row))
+            rows.append(row)
+
+        rows.sort(key=lambda item: (item.get("risk") != "review", item.get("name") or ""))
+        return rows
+
+    def build_integrations(self) -> list[dict[str, Any]]:
+        """Return config-entry/integration audit rows."""
+        entities = self.build_entities()
+        devices = self.build_devices()
+        rows: list[dict[str, Any]] = []
+
+        for entry in self.hass.config_entries.async_entries():
+            entry_entities = [item for item in entities if item.get("config_entry_id") == entry.entry_id]
+            entry_devices = [
+                item
+                for item in devices
+                if entry.entry_id in (item.get("config_entry_ids") or [])
+            ]
+            rows.append(
+                {
+                    "config_entry_id": entry.entry_id,
+                    "domain": entry.domain,
+                    "title": entry.title,
+                    "state": _entry_state_to_string(entry.state),
+                    "device_count": len(entry_devices),
+                    "entity_count": len(entry_entities),
+                    "unavailable_count": sum(
+                        1 for item in entry_entities if item.get("state") == STATE_UNAVAILABLE
+                    ),
+                    "unknown_count": sum(
+                        1 for item in entry_entities if item.get("state") == STATE_UNKNOWN
+                    ),
+                    "disabled_count": sum(1 for item in entry_entities if item.get("disabled")),
+                    "hidden_count": sum(1 for item in entry_entities if item.get("hidden")),
+                }
+            )
+
+        rows.sort(key=lambda item: (item.get("domain") or "", item.get("title") or ""))
+        return rows
+
+    def build_summary(self) -> dict[str, Any]:
+        """Return a summary audit payload."""
+        entities = self.build_entities()
+        devices = self.build_devices()
+        integrations = self.build_integrations()
+
+        unavailable = [item for item in entities if item.get("state") == STATE_UNAVAILABLE]
+        unknown = [item for item in entities if item.get("state") == STATE_UNKNOWN]
+        stale_30 = [
+            item
+            for item in entities
+            if item.get("state") in BAD_STATES
+            and (item.get("duration_current_state_days") or 0) >= 30
+        ]
+        review = [item for item in entities if item.get("risk") == "review"]
+        protected = [item for item in entities if item.get("risk") == "protected"]
+
+        return {
+            "generated_at": dt_util.utcnow().isoformat(),
+            "entities_total": len(entities),
+            "devices_total": len(devices),
+            "integrations_total": len(integrations),
+            "entities_unavailable": len(unavailable),
+            "entities_unknown": len(unknown),
+            "entities_stale_30_days": len(stale_30),
+            "entities_review": len(review),
+            "entities_protected": len(protected),
+            "devices_all_bad": sum(
+                1
+                for item in devices
+                if item.get("entity_count", 0) > 0
+                and (
+                    item.get("unavailable_entity_count", 0)
+                    + item.get("unknown_entity_count", 0)
+                )
+                == item.get("entity_count", 0)
+            ),
+            "note": "v0.1 is read-only and does not scan references yet.",
+        }
+
+    def _build_entity_row(self, entity_id: str, entry: er.RegistryEntry | None) -> dict[str, Any]:
+        """Build a single entity row."""
+        state = self.hass.states.get(entity_id)
+        domain = entity_id.split(".", 1)[0] if "." in entity_id else entity_id
+        duration = _duration_seconds(state, self.now)
+
+        device_id = _safe_attr(entry, "device_id") if entry else None
+        device = self.device_registry.async_get(device_id) if device_id else None
+        area_id = None
+        if entry is not None:
+            area_id = _safe_attr(entry, "area_id")
+        if area_id is None and device is not None:
+            area_id = _safe_attr(device, "area_id")
+        area = self.area_registry.async_get_area(area_id) if area_id else None
+
+        config_entry_id = _safe_attr(entry, "config_entry_id") if entry else None
+        integration_domain = _safe_attr(entry, "platform") if entry else None
+        registry_name = _safe_attr(entry, "name") if entry else None
+        original_name = _safe_attr(entry, "original_name") if entry else None
+
+        row: dict[str, Any] = {
+            "entity_id": entity_id,
+            "domain": domain,
+            "name": registry_name or original_name or (state.name if state else None),
+            "state": state.state if state else None,
+            "last_changed": _as_iso(state.last_changed if state else None),
+            "last_updated": _as_iso(state.last_updated if state else None),
+            "duration_current_state_seconds": duration,
+            "duration_current_state_days": round(duration / 86400, 2) if duration is not None else None,
+            "device_id": device_id,
+            "device_name": (_safe_attr(device, "name_by_user") or _safe_attr(device, "name")) if device else None,
+            "area_id": area_id,
+            "area_name": area.name if area else None,
+            "integration_domain": integration_domain,
+            "config_entry_id": config_entry_id,
+            "entity_category": str(_safe_attr(entry, "entity_category")) if entry and _safe_attr(entry, "entity_category") else None,
+            "disabled": bool(_safe_attr(entry, "disabled_by")) if entry else False,
+            "hidden": bool(_safe_attr(entry, "hidden_by")) if entry else False,
+            "has_registry_entry": entry is not None,
+            "has_state": state is not None,
+            "has_device": device_id is not None,
+            "reference_count": None,
+            "references_scanned": False,
+        }
+        row.update(score_entity(row))
+        return row
