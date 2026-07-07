@@ -1,0 +1,6 @@
+{
+  "name": "HA Janitor",
+  "render_readme": true,
+  "domains": ["ha_janitor"],
+  "homeassistant": "2024.12.0"
+}
