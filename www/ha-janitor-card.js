@@ -125,7 +125,7 @@ class HaJanitorCard extends HTMLElement {
     const payload = {
       exported_at: new Date().toISOString(),
       tool: "HA Janitor",
-      version: "0.1.0",
+      version: "0.1.2",
       note: "v0.1 is read-only. Export is for manual review only.",
       summary: this._summary,
       selected_entities: selectedRows
@@ -147,6 +147,26 @@ class HaJanitorCard extends HTMLElement {
     if (state === "unavailable") return "state state-bad";
     if (state === "unknown") return "state state-warn";
     return "state";
+  }
+
+  _formatDuration(entity) {
+    const seconds = Number(entity.duration_current_state_seconds);
+    if (!Number.isFinite(seconds)) return "–";
+    if (seconds < 60) return "<1 min";
+
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes} min`;
+
+    const hours = Math.floor(minutes / 60);
+    const remainingMinutes = minutes % 60;
+    if (hours < 24) {
+      return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+    }
+
+    const days = Math.floor(hours / 24);
+    const remainingHours = hours % 24;
+    if (remainingHours > 0) return `${days}d ${remainingHours}h`;
+    return `${days}d`;
   }
 
   _renderSummary() {
@@ -242,7 +262,7 @@ class HaJanitorCard extends HTMLElement {
               <th>Risk</th>
               <th>Entity</th>
               <th>State</th>
-              <th>Days</th>
+              <th>Duration</th>
               <th>Device</th>
               <th>Area</th>
               <th>Integration</th>
@@ -259,7 +279,7 @@ class HaJanitorCard extends HTMLElement {
                   <div class="secondary">${this._escape(entity.name || "")}</div>
                 </td>
                 <td><span class="${this._stateClass(entity.state)}">${this._escape(entity.state ?? "no state")}</span></td>
-                <td>${entity.duration_current_state_days ?? "–"}</td>
+                <td>${this._formatDuration(entity)}</td>
                 <td>${this._escape(entity.device_name || "–")}</td>
                 <td>${this._escape(entity.area_name || "–")}</td>
                 <td>${this._escape(entity.integration_domain || "–")}</td>
@@ -425,6 +445,9 @@ class HaJanitorCard extends HTMLElement {
         .table-wrap { overflow-x: auto; border: 1px solid var(--divider-color); border-radius: 10px; }
         table { width: 100%; border-collapse: collapse; font-size: 13px; }
         th, td { padding: 9px 8px; border-bottom: 1px solid var(--divider-color); text-align: left; vertical-align: top; }
+        th:first-child, td:first-child { width: 38px; text-align: center; }
+        input.rowSelect { width: 22px; height: 22px; min-width: 22px; margin: 0; cursor: pointer; accent-color: var(--primary-color); }
+        td:has(input.rowSelect) { vertical-align: middle; }
         th { font-weight: 600; color: var(--secondary-text-color); white-space: nowrap; }
         tr:last-child td { border-bottom: 0; }
         .primary { font-weight: 600; white-space: nowrap; }
