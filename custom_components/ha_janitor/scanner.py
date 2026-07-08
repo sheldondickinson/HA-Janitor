@@ -1,4 +1,4 @@
-"""Read-only scanner for HA Janitor v0.2."""
+"""Read-only scanner for HA Janitor v0.4."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
+from .recorder_analyser import RecorderAnalyser
 from .reference_scanner import ReferenceScanner
 from .scoring import score_device, score_entity
 
@@ -61,8 +62,9 @@ class JanitorScanner:
         self.area_registry = ar.async_get(hass)
         self.now = dt_util.utcnow()
         self._reference_scan: dict[str, Any] | None = None
+        self._recorder_summary: dict[str, Any] | None = None
 
-    def build_entities(self, include_references: bool = True) -> list[dict[str, Any]]:
+    def build_entities(self, include_references: bool = True, include_recorder: bool = True) -> list[dict[str, Any]]:
         """Return entity audit rows."""
         registry_entities = _registry_items(self.entity_registry.entities)
         state_entity_ids = set(self.hass.states.async_entity_ids())
@@ -82,7 +84,17 @@ class JanitorScanner:
                 )
             )
 
-        rows.sort(key=lambda item: (item.get("risk") != "review", item.get("reference_count", 0) > 0, item.get("entity_id") or ""))
+        if include_recorder:
+            self._recorder_summary = RecorderAnalyser(self.hass).analyse(rows)
+        else:
+            self._recorder_summary = {"recorder_status": "disabled", "recorder_available": False}
+
+        rows.sort(key=lambda item: (
+            item.get("risk") != "review",
+            item.get("reference_count", 0) > 0,
+            -(item.get("recorder_bad_streak_days") or item.get("duration_current_state_days") or 0),
+            item.get("entity_id") or "",
+        ))
         return rows
 
     def build_devices(self, entities: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
@@ -104,17 +116,12 @@ class JanitorScanner:
             unknown_count = sum(1 for item in linked_entities if item.get("state") == STATE_UNKNOWN)
             disabled_count = sum(1 for item in linked_entities if item.get("disabled"))
             hidden_count = sum(1 for item in linked_entities if item.get("hidden"))
-            healthy_count = sum(
-                1
-                for item in linked_entities
-                if item.get("state") not in BAD_STATES and item.get("state") is not None
-            )
+            healthy_count = sum(1 for item in linked_entities if item.get("state") not in BAD_STATES and item.get("state") is not None)
             reference_count = sum(int(item.get("reference_count") or 0) for item in linked_entities)
+            max_recorder_bad_streak_days = max((item.get("recorder_bad_streak_days") or 0 for item in linked_entities), default=0)
 
             config_entry_ids = sorted(str(value) for value in (_safe_attr(device, "config_entries", set()) or set()))
-            integration_domains = sorted(
-                {entry.domain for entry in config_entries if entry.entry_id in config_entry_ids}
-            )
+            integration_domains = sorted({entry.domain for entry in config_entries if entry.entry_id in config_entry_ids})
             area_id = _safe_attr(device, "area_id")
             area = self.area_registry.async_get_area(area_id) if area_id else None
 
@@ -135,18 +142,15 @@ class JanitorScanner:
                 "hidden_entity_count": hidden_count,
                 "healthy_entity_count": healthy_count,
                 "reference_count": reference_count,
+                "max_recorder_bad_streak_days": max_recorder_bad_streak_days,
             }
             row.update(score_device(row))
             rows.append(row)
 
-        rows.sort(key=lambda item: (item.get("risk") != "review", item.get("name") or ""))
+        rows.sort(key=lambda item: (item.get("risk") != "review", -(item.get("max_recorder_bad_streak_days") or 0), item.get("name") or ""))
         return rows
 
-    def build_integrations(
-        self,
-        entities: list[dict[str, Any]] | None = None,
-        devices: list[dict[str, Any]] | None = None,
-    ) -> list[dict[str, Any]]:
+    def build_integrations(self, entities: list[dict[str, Any]] | None = None, devices: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         """Return config-entry/integration audit rows."""
         if entities is None:
             entities = self.build_entities()
@@ -157,22 +161,21 @@ class JanitorScanner:
         for entry in self.hass.config_entries.async_entries():
             entry_entities = [item for item in entities if item.get("config_entry_id") == entry.entry_id]
             entry_devices = [item for item in devices if entry.entry_id in (item.get("config_entry_ids") or [])]
-            rows.append(
-                {
-                    "config_entry_id": entry.entry_id,
-                    "domain": entry.domain,
-                    "title": entry.title,
-                    "state": _entry_state_to_string(entry.state),
-                    "device_count": len(entry_devices),
-                    "entity_count": len(entry_entities),
-                    "unavailable_count": sum(1 for item in entry_entities if item.get("state") == STATE_UNAVAILABLE),
-                    "unknown_count": sum(1 for item in entry_entities if item.get("state") == STATE_UNKNOWN),
-                    "disabled_count": sum(1 for item in entry_entities if item.get("disabled")),
-                    "hidden_count": sum(1 for item in entry_entities if item.get("hidden")),
-                    "reference_count": sum(int(item.get("reference_count") or 0) for item in entry_entities),
-                    "referenced_entity_count": sum(1 for item in entry_entities if int(item.get("reference_count") or 0) > 0),
-                }
-            )
+            rows.append({
+                "config_entry_id": entry.entry_id,
+                "domain": entry.domain,
+                "title": entry.title,
+                "state": _entry_state_to_string(entry.state),
+                "device_count": len(entry_devices),
+                "entity_count": len(entry_entities),
+                "unavailable_count": sum(1 for item in entry_entities if item.get("state") == STATE_UNAVAILABLE),
+                "unknown_count": sum(1 for item in entry_entities if item.get("state") == STATE_UNKNOWN),
+                "disabled_count": sum(1 for item in entry_entities if item.get("disabled")),
+                "hidden_count": sum(1 for item in entry_entities if item.get("hidden")),
+                "reference_count": sum(int(item.get("reference_count") or 0) for item in entry_entities),
+                "referenced_entity_count": sum(1 for item in entry_entities if int(item.get("reference_count") or 0) > 0),
+                "max_recorder_bad_streak_days": max((item.get("recorder_bad_streak_days") or 0 for item in entry_entities), default=0),
+            })
 
         rows.sort(key=lambda item: (item.get("domain") or "", item.get("title") or ""))
         return rows
@@ -203,20 +206,18 @@ class JanitorScanner:
         integrations = self.build_integrations(entities, devices)
         reference_scan = self.build_reference_scan()
         reference_summary = reference_scan.get("summary", {})
+        recorder_summary = self._recorder_summary or {}
 
         unavailable = [item for item in entities if item.get("state") == STATE_UNAVAILABLE]
         unknown = [item for item in entities if item.get("state") == STATE_UNKNOWN]
-        stale_30 = [
-            item for item in entities
-            if item.get("state") in BAD_STATES and (item.get("duration_current_state_days") or 0) >= 30
-        ]
+        stale_30 = [item for item in entities if item.get("state") in BAD_STATES and (item.get("recorder_bad_streak_days") or item.get("duration_current_state_days") or 0) >= 30]
         review = [item for item in entities if item.get("risk") == "review"]
         protected = [item for item in entities if item.get("risk") == "protected"]
         referenced = [item for item in entities if int(item.get("reference_count") or 0) > 0]
 
         return {
             "generated_at": dt_util.utcnow().isoformat(),
-            "version": "0.2.0",
+            "version": "0.4.0",
             "entities_total": len(entities),
             "devices_total": len(devices),
             "integrations_total": len(integrations),
@@ -231,22 +232,12 @@ class JanitorScanner:
             "total_broken_references": reference_summary.get("total_broken_references", 0),
             "files_scanned": reference_summary.get("files_scanned", 0),
             "files_failed": reference_summary.get("files_failed", 0),
-            "devices_all_bad": sum(
-                1
-                for item in devices
-                if item.get("entity_count", 0) > 0
-                and (item.get("unavailable_entity_count", 0) + item.get("unknown_entity_count", 0)) == item.get("entity_count", 0)
-            ),
-            "note": "v0.2 is read-only and includes static reference scanning.",
+            "devices_all_bad": sum(1 for item in devices if item.get("entity_count", 0) > 0 and (item.get("unavailable_entity_count", 0) + item.get("unknown_entity_count", 0)) == item.get("entity_count", 0)),
+            "recorder": recorder_summary,
+            "note": "v0.4 is read-only and includes static reference scanning plus SQLite recorder duration analysis.",
         }
 
-    def _build_entity_row(
-        self,
-        entity_id: str,
-        entry: Any | None,
-        references: list[dict[str, Any]] | None = None,
-        references_scanned: bool = False,
-    ) -> dict[str, Any]:
+    def _build_entity_row(self, entity_id: str, entry: Any | None, references: list[dict[str, Any]] | None = None, references_scanned: bool = False) -> dict[str, Any]:
         """Build a single entity row."""
         state = self.hass.states.get(entity_id)
         domain = entity_id.split(".", 1)[0] if "." in entity_id else entity_id
