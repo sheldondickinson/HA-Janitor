@@ -1,4 +1,4 @@
-"""Read-only scanner for HA Janitor v0.1."""
+"""Read-only scanner for HA Janitor v0.2."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
+from .reference_scanner import ReferenceScanner
 from .scoring import score_device, score_entity
 
 BAD_STATES = {STATE_UNAVAILABLE, STATE_UNKNOWN}
@@ -59,18 +60,29 @@ class JanitorScanner:
         self.device_registry = dr.async_get(hass)
         self.area_registry = ar.async_get(hass)
         self.now = dt_util.utcnow()
+        self._reference_scan: dict[str, Any] | None = None
 
-    def build_entities(self) -> list[dict[str, Any]]:
+    def build_entities(self, include_references: bool = True) -> list[dict[str, Any]]:
         """Return entity audit rows."""
         registry_entities = _registry_items(self.entity_registry.entities)
         state_entity_ids = set(self.hass.states.async_entity_ids())
         all_entity_ids = sorted(set(registry_entities) | state_entity_ids)
+        reference_scan = self.build_reference_scan(all_entity_ids) if include_references else None
+        reference_index = (reference_scan or {}).get("references", {})
 
         rows: list[dict[str, Any]] = []
         for entity_id in all_entity_ids:
-            rows.append(self._build_entity_row(entity_id, registry_entities.get(entity_id)))
+            references = reference_index.get(entity_id, [])
+            rows.append(
+                self._build_entity_row(
+                    entity_id,
+                    registry_entities.get(entity_id),
+                    references=references,
+                    references_scanned=include_references,
+                )
+            )
 
-        rows.sort(key=lambda item: (item.get("risk") != "review", item.get("entity_id") or ""))
+        rows.sort(key=lambda item: (item.get("risk") != "review", item.get("reference_count", 0) > 0, item.get("entity_id") or ""))
         return rows
 
     def build_devices(self, entities: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
@@ -97,14 +109,11 @@ class JanitorScanner:
                 for item in linked_entities
                 if item.get("state") not in BAD_STATES and item.get("state") is not None
             )
+            reference_count = sum(int(item.get("reference_count") or 0) for item in linked_entities)
 
             config_entry_ids = sorted(str(value) for value in (_safe_attr(device, "config_entries", set()) or set()))
             integration_domains = sorted(
-                {
-                    entry.domain
-                    for entry in config_entries
-                    if entry.entry_id in config_entry_ids
-                }
+                {entry.domain for entry in config_entries if entry.entry_id in config_entry_ids}
             )
             area_id = _safe_attr(device, "area_id")
             area = self.area_registry.async_get_area(area_id) if area_id else None
@@ -125,6 +134,7 @@ class JanitorScanner:
                 "disabled_entity_count": disabled_count,
                 "hidden_entity_count": hidden_count,
                 "healthy_entity_count": healthy_count,
+                "reference_count": reference_count,
             }
             row.update(score_device(row))
             rows.append(row)
@@ -146,11 +156,7 @@ class JanitorScanner:
         rows: list[dict[str, Any]] = []
         for entry in self.hass.config_entries.async_entries():
             entry_entities = [item for item in entities if item.get("config_entry_id") == entry.entry_id]
-            entry_devices = [
-                item
-                for item in devices
-                if entry.entry_id in (item.get("config_entry_ids") or [])
-            ]
+            entry_devices = [item for item in devices if entry.entry_id in (item.get("config_entry_ids") or [])]
             rows.append(
                 {
                     "config_entry_id": entry.entry_id,
@@ -159,18 +165,35 @@ class JanitorScanner:
                     "state": _entry_state_to_string(entry.state),
                     "device_count": len(entry_devices),
                     "entity_count": len(entry_entities),
-                    "unavailable_count": sum(
-                        1 for item in entry_entities if item.get("state") == STATE_UNAVAILABLE
-                    ),
-                    "unknown_count": sum(
-                        1 for item in entry_entities if item.get("state") == STATE_UNKNOWN
-                    ),
+                    "unavailable_count": sum(1 for item in entry_entities if item.get("state") == STATE_UNAVAILABLE),
+                    "unknown_count": sum(1 for item in entry_entities if item.get("state") == STATE_UNKNOWN),
                     "disabled_count": sum(1 for item in entry_entities if item.get("disabled")),
                     "hidden_count": sum(1 for item in entry_entities if item.get("hidden")),
+                    "reference_count": sum(int(item.get("reference_count") or 0) for item in entry_entities),
+                    "referenced_entity_count": sum(1 for item in entry_entities if int(item.get("reference_count") or 0) > 0),
                 }
             )
 
         rows.sort(key=lambda item: (item.get("domain") or "", item.get("title") or ""))
+        return rows
+
+    def build_reference_scan(self, known_entity_ids: set[str] | list[str] | None = None) -> dict[str, Any]:
+        """Return static reference scan payload, cached per scanner instance."""
+        if self._reference_scan is not None:
+            return self._reference_scan
+        if known_entity_ids is None:
+            registry_entities = _registry_items(self.entity_registry.entities)
+            known_entity_ids = set(registry_entities) | set(self.hass.states.async_entity_ids())
+        self._reference_scan = ReferenceScanner(self.hass, set(known_entity_ids)).scan()
+        return self._reference_scan
+
+    def build_broken_references(self) -> list[dict[str, Any]]:
+        """Return broken reference rows."""
+        scan = self.build_reference_scan()
+        rows: list[dict[str, Any]] = []
+        for target, refs in scan.get("broken_references", {}).items():
+            rows.append({"target": target, "reference_count": len(refs), "references": refs})
+        rows.sort(key=lambda item: (-item["reference_count"], item["target"]))
         return rows
 
     def build_summary(self) -> dict[str, Any]:
@@ -178,20 +201,22 @@ class JanitorScanner:
         entities = self.build_entities()
         devices = self.build_devices(entities)
         integrations = self.build_integrations(entities, devices)
+        reference_scan = self.build_reference_scan()
+        reference_summary = reference_scan.get("summary", {})
 
         unavailable = [item for item in entities if item.get("state") == STATE_UNAVAILABLE]
         unknown = [item for item in entities if item.get("state") == STATE_UNKNOWN]
         stale_30 = [
-            item
-            for item in entities
-            if item.get("state") in BAD_STATES
-            and (item.get("duration_current_state_days") or 0) >= 30
+            item for item in entities
+            if item.get("state") in BAD_STATES and (item.get("duration_current_state_days") or 0) >= 30
         ]
         review = [item for item in entities if item.get("risk") == "review"]
         protected = [item for item in entities if item.get("risk") == "protected"]
+        referenced = [item for item in entities if int(item.get("reference_count") or 0) > 0]
 
         return {
             "generated_at": dt_util.utcnow().isoformat(),
+            "version": "0.2.0",
             "entities_total": len(entities),
             "devices_total": len(devices),
             "integrations_total": len(integrations),
@@ -200,24 +225,33 @@ class JanitorScanner:
             "entities_stale_30_days": len(stale_30),
             "entities_review": len(review),
             "entities_protected": len(protected),
+            "entities_referenced": len(referenced),
+            "entities_unreferenced": len(entities) - len(referenced),
+            "broken_reference_targets": reference_summary.get("broken_reference_targets", 0),
+            "total_broken_references": reference_summary.get("total_broken_references", 0),
+            "files_scanned": reference_summary.get("files_scanned", 0),
+            "files_failed": reference_summary.get("files_failed", 0),
             "devices_all_bad": sum(
                 1
                 for item in devices
                 if item.get("entity_count", 0) > 0
-                and (
-                    item.get("unavailable_entity_count", 0)
-                    + item.get("unknown_entity_count", 0)
-                )
-                == item.get("entity_count", 0)
+                and (item.get("unavailable_entity_count", 0) + item.get("unknown_entity_count", 0)) == item.get("entity_count", 0)
             ),
-            "note": "v0.1 is read-only and does not scan references yet.",
+            "note": "v0.2 is read-only and includes static reference scanning.",
         }
 
-    def _build_entity_row(self, entity_id: str, entry: Any | None) -> dict[str, Any]:
+    def _build_entity_row(
+        self,
+        entity_id: str,
+        entry: Any | None,
+        references: list[dict[str, Any]] | None = None,
+        references_scanned: bool = False,
+    ) -> dict[str, Any]:
         """Build a single entity row."""
         state = self.hass.states.get(entity_id)
         domain = entity_id.split(".", 1)[0] if "." in entity_id else entity_id
         duration = _duration_seconds(state, self.now)
+        references = references or []
 
         device_id = _safe_attr(entry, "device_id") if entry else None
         device = self.device_registry.async_get(device_id) if device_id else None
@@ -252,8 +286,9 @@ class JanitorScanner:
             "has_registry_entry": entry is not None,
             "has_state": state is not None,
             "has_device": device_id is not None,
-            "reference_count": None,
-            "references_scanned": False,
+            "reference_count": len(references),
+            "references": references[:20],
+            "references_scanned": references_scanned,
         }
         row.update(score_entity(row))
         return row
