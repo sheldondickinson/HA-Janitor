@@ -13,6 +13,7 @@ from homeassistant.core import HomeAssistant, callback
 
 from .review_store import ReviewStore
 from .scanner import JanitorScanner
+from .spook_adapter import SpookAdapter
 
 
 @callback
@@ -28,6 +29,8 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_set_entity_review)
     websocket_api.async_register_command(hass, websocket_clear_entity_review)
     websocket_api.async_register_command(hass, websocket_export_entities_csv)
+    websocket_api.async_register_command(hass, websocket_get_capabilities)
+    websocket_api.async_register_command(hass, websocket_run_entity_action)
 
 
 @websocket_api.websocket_command({vol.Required("type"): "ha_janitor/get_summary"})
@@ -36,6 +39,7 @@ async def websocket_get_summary(hass: HomeAssistant, connection: websocket_api.A
     """Return audit summary."""
     summary = JanitorScanner(hass).build_summary()
     summary["review_counts"] = await ReviewStore(hass).async_counts()
+    summary["capabilities"] = SpookAdapter(hass).capabilities()
     connection.send_result(msg["id"], summary)
 
 
@@ -117,10 +121,7 @@ async def websocket_set_entity_review(hass: HomeAssistant, connection: websocket
     """Set persistent review state for an entity."""
     try:
         row = await ReviewStore(hass).async_set_entity(
-            msg["entity_id"],
-            msg["disposition"],
-            note=msg.get("note"),
-            ignore_until=msg.get("ignore_until"),
+            msg["entity_id"], msg["disposition"], note=msg.get("note"), ignore_until=msg.get("ignore_until")
         )
     except ValueError as err:
         connection.send_error(msg["id"], "invalid_disposition", str(err))
@@ -153,3 +154,28 @@ async def websocket_export_entities_csv(hass: HomeAssistant, connection: websock
     writer.writeheader()
     writer.writerows(rows)
     connection.send_result(msg["id"], {"filename": "ha-janitor-entities.csv", "csv": output.getvalue()})
+
+
+@websocket_api.websocket_command({vol.Required("type"): "ha_janitor/get_capabilities"})
+@websocket_api.async_response
+async def websocket_get_capabilities(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]) -> None:
+    """Return optional action capabilities."""
+    connection.send_result(msg["id"], SpookAdapter(hass).capabilities())
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "ha_janitor/run_entity_action",
+        vol.Required("action"): vol.In(["disable_entity", "enable_entity", "hide_entity", "unhide_entity"]),
+        vol.Required("entity_ids"): [str],
+    }
+)
+@websocket_api.async_response
+async def websocket_run_entity_action(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]) -> None:
+    """Run a safe optional entity action."""
+    try:
+        result = await SpookAdapter(hass).async_entity_action(msg["action"], msg["entity_ids"])
+    except (ValueError, RuntimeError) as err:
+        connection.send_error(msg["id"], "action_failed", str(err))
+        return
+    connection.send_result(msg["id"], result)
