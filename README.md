@@ -4,30 +4,55 @@ Read-only Home Assistant audit helper for finding stale, unavailable, unknown, d
 
 ## Status
 
-**v0.1 is audit-only.**
+**v0.2 is read-only.**
 
 It does not delete, disable, hide, purge, remove, repair or mutate anything in Home Assistant.
 
-## What v0.1 does
+## What v0.2 does
 
 - Adds a Home Assistant custom integration: `ha_janitor`
 - Exposes read-only WebSocket endpoints
 - Audits entities, devices and integration/config entries
-- Calculates basic stale-state duration
-- Applies conservative risk/review scoring
-- Provides a simple Lovelace custom card
+- Calculates current in-memory state duration
+- Scans static Home Assistant config/dashboard files for entity references
+- Adds reference counts to entity/device/integration rows
+- Detects likely broken entity references
+- Provides a Lovelace custom card with entity, device, integration and broken-reference tabs
 - Supports checkbox selection and JSON export from the card
 
-## What v0.1 deliberately does not do
+## What v0.2 deliberately does not do
 
 - No Spook actions
 - No delete actions
 - No disable/hide actions
 - No recorder purging
 - No `.storage` mutation
-- No automation/dashboard reference scanning yet
+- No historical duration analysis from recorder yet
 
-Reference scanning and Spook-backed safe actions are planned for later releases.
+## Reference scanning scope
+
+v0.2 scans these locations under the Home Assistant config directory:
+
+```text
+configuration.yaml
+automations.yaml
+scripts.yaml
+scenes.yaml
+groups.yaml
+ui-lovelace.yaml
+packages/**/*.yaml
+packages/**/*.yml
+dashboards/**/*.yaml
+dashboards/**/*.yml
+blueprints/**/*.yaml
+blueprints/**/*.yml
+custom_templates/**/*.yaml
+custom_templates/**/*.yml
+.storage/lovelace*
+.storage/dashboard*
+```
+
+The scanner is static text-based. It is useful, but not perfect. False positives are possible where service/action names look like entity IDs.
 
 ## Installation for development
 
@@ -44,7 +69,7 @@ cp -R HA-Janitor/custom_components/ha_janitor custom_components/ha_janitor
 cp HA-Janitor/www/ha-janitor-card.js www/ha-janitor-card.js
 ```
 
-Restart Home Assistant.
+Restart Home Assistant after backend integration changes.
 
 Then go to:
 
@@ -57,7 +82,7 @@ Settings → Devices & services → Add integration → HA Janitor
 Add this JavaScript module as a dashboard resource:
 
 ```text
-/local/ha-janitor-card.js
+/local/ha-janitor-card.js?v=0.2.0
 ```
 
 Resource type:
@@ -71,27 +96,30 @@ Then add a manual card:
 ```yaml
 type: custom:ha-janitor-card
 title: HA Janitor
-show_limit: 250
+show_limit: 500
 ```
 
-## v0.1 WebSocket endpoints
+## v0.2 WebSocket endpoints
 
 ```text
 ha_janitor/get_summary
 ha_janitor/get_entities
 ha_janitor/get_devices
 ha_janitor/get_integrations
+ha_janitor/get_references
+ha_janitor/get_broken_references
 ```
 
-Example browser console call from Home Assistant frontend context:
+Example browser console calls from Home Assistant frontend context:
 
 ```js
 await hass.callWS({ type: "ha_janitor/get_summary" })
+await hass.callWS({ type: "ha_janitor/get_broken_references", limit: 100 })
 ```
 
-## Risk model in v0.1
+## Risk model
 
-v0.1 is intentionally conservative because it does not yet scan automations, scripts, scenes or dashboards.
+v0.2 is still intentionally conservative. Reference scanning improves confidence, but HA Janitor still does not declare anything safe to delete.
 
 | Risk | Meaning |
 |---|---|
@@ -99,19 +127,13 @@ v0.1 is intentionally conservative because it does not yet scan automations, scr
 | `review` | Needs human review |
 | `info` | Informational, usually disabled/hidden/currently OK |
 
-There is no `safe` deletion recommendation in v0.1.
+There is no `safe` deletion recommendation in v0.2.
 
 ## Roadmap
 
-### v0.2
-
-- YAML reference scanner
-- Dashboard reference scanner
-- Broken entity/action references
-- Better risk scoring
-
 ### v0.3
 
+- Recorder-backed historical unavailable/unknown duration analysis
 - Review state store
 - Keep / ignore / reviewed flags
 - CSV export
