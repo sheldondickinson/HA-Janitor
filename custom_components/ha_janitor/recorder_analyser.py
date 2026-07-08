@@ -59,8 +59,11 @@ class RecorderAnalyser:
             row.setdefault("recorder_supported", False)
             row.setdefault("recorder_bad_streak_days", None)
             row.setdefault("recorder_bad_streak_start", None)
+            row.setdefault("recorder_bad_streak_is_capped", False)
+            row.setdefault("recorder_bad_streak_basis", "none")
             row.setdefault("recorder_last_healthy_state", None)
             row.setdefault("recorder_last_healthy_at", None)
+            row.setdefault("recorder_oldest_state_at", None)
             row.setdefault("recorder_rows_examined", 0)
 
         if not self.db_path.exists():
@@ -88,7 +91,7 @@ class RecorderAnalyser:
                 entity_id = row.get("entity_id")
                 if not entity_id:
                     continue
-                history = self._analyse_entity(conn, schema, entity_id, row.get("state"))
+                history = self._analyse_entity(conn, schema, entity_id)
                 row.update(history)
         except sqlite3.Error as err:
             self.status = "sqlite_query_failed"
@@ -128,14 +131,17 @@ class RecorderAnalyser:
         if "last_changed_ts" in cols:
             return "last_changed_ts"
         if "last_updated" in cols:
-            # Legacy string timestamps are harder to handle. Let SQLite try.
             return "strftime('%s', last_updated)"
         if "last_changed" in cols:
             return "strftime('%s', last_changed)"
         return "NULL"
 
-    def _analyse_entity(self, conn: sqlite3.Connection, schema: str, entity_id: str, current_state: str | None) -> dict[str, Any]:
-        """Analyse the bad-state streak for one entity."""
+    def _analyse_entity(self, conn: sqlite3.Connection, schema: str, entity_id: str) -> dict[str, Any]:
+        """Analyse the bad-state streak for one entity.
+
+        If no healthy state is found in the recorder window, the result is a
+        lower bound, not an exact duration. Example: >= 9.56 days.
+        """
         time_col = self._time_column(conn)
         if schema == "modern":
             query = f"""
@@ -161,8 +167,11 @@ class RecorderAnalyser:
             "recorder_rows_examined": len(rows),
             "recorder_bad_streak_days": None,
             "recorder_bad_streak_start": None,
+            "recorder_bad_streak_is_capped": False,
+            "recorder_bad_streak_basis": "none",
             "recorder_last_healthy_state": None,
             "recorder_last_healthy_at": None,
+            "recorder_oldest_state_at": None,
         }
         if not rows:
             return result
@@ -170,9 +179,8 @@ class RecorderAnalyser:
         bad_start_ts: float | None = None
         last_healthy_state: str | None = None
         last_healthy_ts: float | None = None
+        oldest_ts: float | None = None
 
-        # Walk newest to oldest. The bad streak continues until we find a state
-        # that is not unavailable/unknown.
         for db_row in rows:
             state = db_row["state"]
             ts = db_row["ts"]
@@ -180,6 +188,9 @@ class RecorderAnalyser:
                 ts_float = float(ts) if ts is not None else None
             except (TypeError, ValueError):
                 ts_float = None
+
+            if ts_float is not None:
+                oldest_ts = ts_float
 
             if state in BAD_STATES:
                 if ts_float is not None:
@@ -190,20 +201,28 @@ class RecorderAnalyser:
             last_healthy_ts = ts_float
             break
 
-        result["recorder_bad_streak_start"] = _iso_from_ts(bad_start_ts)
-        result["recorder_bad_streak_days"] = _days_since(bad_start_ts)
         result["recorder_last_healthy_state"] = last_healthy_state
         result["recorder_last_healthy_at"] = _iso_from_ts(last_healthy_ts)
+        result["recorder_oldest_state_at"] = _iso_from_ts(oldest_ts)
 
-        # If recorder has not yet captured the current bad state but HA says it
-        # is currently bad, leave the HA in-memory duration as the fallback.
-        if current_state in BAD_STATES and result["recorder_bad_streak_days"] is None:
+        if bad_start_ts is None:
             return result
+
+        result["recorder_bad_streak_start"] = _iso_from_ts(bad_start_ts)
+        result["recorder_bad_streak_days"] = _days_since(bad_start_ts)
+
+        if last_healthy_state is None:
+            result["recorder_bad_streak_is_capped"] = True
+            result["recorder_bad_streak_basis"] = "lower_bound_no_healthy_state_in_retention_window"
+        else:
+            result["recorder_bad_streak_basis"] = "exact_last_healthy_state_found"
+
         return result
 
     def _summary(self, rows: list[dict[str, Any]], bad_rows: list[dict[str, Any]]) -> dict[str, Any]:
         """Return recorder analysis summary."""
         annotated = [row for row in rows if row.get("recorder_bad_streak_days") is not None]
+        capped = [row for row in rows if row.get("recorder_bad_streak_is_capped")]
         return {
             "recorder_status": self.status,
             "recorder_available": self.available,
@@ -212,4 +231,6 @@ class RecorderAnalyser:
             "recorder_db_path": str(self.db_path),
             "recorder_bad_entities_checked": len(bad_rows),
             "recorder_entities_annotated": len(annotated),
+            "recorder_entities_capped": len(capped),
+            "recorder_note": "Capped values are lower bounds caused by recorder retention/no healthy state found.",
         }
