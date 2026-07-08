@@ -4,16 +4,17 @@ Read-only Home Assistant audit helper for finding stale, unavailable, unknown, d
 
 ## Status
 
-**v0.3 is read-only.**
+**v0.4 is read-only.**
 
 It does not delete, disable, hide, purge, remove, repair or mutate anything in Home Assistant.
 
-## What v0.3 does
+## What v0.4 does
 
 - Adds a Home Assistant custom integration: `ha_janitor`
 - Exposes read-only WebSocket endpoints
 - Audits entities, devices and integration/config entries
 - Calculates current in-memory state duration
+- Adds read-only SQLite recorder-backed unavailable/unknown streak analysis
 - Scans static Home Assistant config/dashboard files for entity references
 - Adds reference counts to entity/device/integration rows
 - Detects likely broken entity references
@@ -22,19 +23,41 @@ It does not delete, disable, hide, purge, remove, repair or mutate anything in H
 - Adds review-state filters and review summary cards
 - Adds CSV export and JSON export
 - Provides a Lovelace custom card with entity, device, integration and broken-reference tabs
+- Debounces search input so filtering waits briefly after typing
 
-## What v0.3 deliberately does not do
+## What v0.4 deliberately does not do
 
 - No Spook actions
 - No delete actions
 - No disable/hide actions
 - No recorder purging
 - No `.storage` mutation
-- No historical duration analysis from recorder yet
+- No direct database writes
+- No support yet for non-SQLite recorder databases
+
+## Recorder analysis
+
+v0.4 opens the default Home Assistant SQLite recorder database read-only:
+
+```text
+/config/home-assistant_v2.db
+```
+
+It attempts to calculate, for currently `unavailable` or `unknown` entities:
+
+```text
+recorder_bad_streak_days
+recorder_bad_streak_start
+recorder_last_healthy_state
+recorder_last_healthy_at
+recorder_rows_examined
+```
+
+If the database is missing, locked, external, or using an unsupported schema, HA Janitor degrades cleanly and continues with live state duration only.
 
 ## Reference scanning scope
 
-v0.3 scans these locations under the Home Assistant config directory:
+v0.4 scans these locations under the Home Assistant config directory:
 
 ```text
 configuration.yaml
@@ -107,7 +130,7 @@ Settings → Devices & services → Add integration → HA Janitor
 Add this JavaScript module as a dashboard resource:
 
 ```text
-/local/ha-janitor-card.js?v=0.3.0
+/local/ha-janitor-card.js?v=0.4.0
 ```
 
 Resource type:
@@ -124,7 +147,7 @@ title: HA Janitor
 show_limit: 500
 ```
 
-## v0.3 WebSocket endpoints
+## v0.4 WebSocket endpoints
 
 ```text
 ha_janitor/get_summary
@@ -149,7 +172,7 @@ await hass.callWS({ type: "ha_janitor/set_entity_review", entity_id: "sensor.exa
 
 ## Risk model
 
-v0.3 is still intentionally conservative. Reference scanning and review state improve workflow, but HA Janitor still does not declare anything safe to delete.
+v0.4 is still intentionally conservative. Reference scanning, review state and recorder duration improve workflow, but HA Janitor still does not declare anything safe to delete.
 
 | Risk | Meaning |
 |---|---|
@@ -157,13 +180,12 @@ v0.3 is still intentionally conservative. Reference scanning and review state im
 | `review` | Needs human review |
 | `info` | Informational, usually disabled/hidden/currently OK |
 
-There is no `safe` deletion recommendation in v0.3.
+There is no `safe` deletion recommendation in v0.4.
 
 ## Roadmap
 
-### v0.4
+### v0.5
 
-- Recorder-backed historical unavailable/unknown duration analysis
 - Optional Spook adapter
 - Safe actions only: hide/unhide, disable/enable
 
