@@ -144,8 +144,10 @@ async def websocket_export_entities_csv(hass: HomeAssistant, connection: websock
     rows = await ReviewStore(hass).async_merge_entity_rows(rows)
     output = io.StringIO()
     fieldnames = [
-        "entity_id", "name", "state", "duration_current_state_days", "risk", "disposition", "review_note",
-        "reference_count", "device_name", "area_name", "integration_domain", "recommendation",
+        "entity_id", "name", "state", "duration_current_state_days", "recorder_bad_streak_days",
+        "recorder_bad_streak_start", "recorder_last_healthy_state", "recorder_last_healthy_at",
+        "recorder_rows_examined", "risk", "disposition", "review_note", "reference_count",
+        "device_name", "area_name", "integration_domain", "recommendation",
     ]
     writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
